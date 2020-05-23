@@ -385,6 +385,67 @@ namespace PgpCore
             }
         }
 
+        public void EncryptFile(
+            string inputFilePath,
+            string outputFilePath,
+            char[] passPhrase,
+            bool armor = true,
+            bool withIntegrityCheck = true,
+            string name = DefaultFileName)
+        {
+            if (String.IsNullOrEmpty(inputFilePath))
+                throw new ArgumentException("InputFilePath");
+            if (String.IsNullOrEmpty(outputFilePath))
+                throw new ArgumentException("OutputFilePath");
+            if (!File.Exists(inputFilePath))
+                throw new FileNotFoundException(String.Format("Input file [{0}] does not exist.", inputFilePath));
+
+            using (FileStream inputStream = new FileStream(inputFilePath, FileMode.Open, FileAccess.Read))
+                using (Stream outputStream = File.Create(outputFilePath))
+                    EncryptStream(inputStream, outputStream, passPhrase, armor, withIntegrityCheck, name);
+        }
+
+        public void EncryptStream(Stream inputStream, Stream outputStream, char[] passPhrase,
+            bool armor = true, bool withIntegrityCheck = true, string name = DefaultFileName)
+        {
+            if (inputStream == null)
+                throw new ArgumentException("InputStream");
+            if (outputStream == null)
+                throw new ArgumentException("OutputStream");
+
+            if (name == DefaultFileName && inputStream is FileStream)
+            {
+                string inputFilePath = ((FileStream)inputStream).Name;
+                name = Path.GetFileName(inputFilePath);
+            }
+
+            if (armor)
+            {
+                outputStream = new ArmoredOutputStream(outputStream);
+            }
+
+            PgpEncryptedDataGenerator pk = new PgpEncryptedDataGenerator(SymmetricKeyAlgorithmTag.Cast5, withIntegrityCheck, new SecureRandom());
+            pk.AddMethod(passPhrase);
+
+            Stream @out = pk.Open(outputStream, new byte[1 << 16]);
+
+            if (CompressionAlgorithm != CompressionAlgorithmTag.Uncompressed)
+            {
+                PgpCompressedDataGenerator comData = new PgpCompressedDataGenerator(CompressionAlgorithm);
+                Utilities.WriteStreamToLiteralData(comData.Open(@out), FileTypeToChar(), inputStream, name);
+                comData.Close();
+            }
+            else
+                Utilities.WriteStreamToLiteralData(@out, FileTypeToChar(), inputStream, name);
+
+            @out.Close();
+
+            if (armor)
+            {
+                outputStream.Close();
+            }
+        }
+
         #endregion Encrypt
 
         #region Encrypt and Sign
@@ -1443,6 +1504,142 @@ namespace PgpCore
                 throw new PgpException("Message is not a simple encrypted file.");
         }
 
+        /// <summary>
+        /// PGP decrypt a given stream.
+        /// </summary>
+        /// <param name="inputStream">PGP encrypted data stream</param>
+        /// <param name="outputStream">Output PGP decrypted stream</param>
+        /// <param name="passPhrase">PGP secret key password</param>
+        public Stream DecryptStream(Stream inputStream, Stream outputStream, string passPhrase)
+        {
+            if (inputStream == null)
+                throw new ArgumentException("InputStream");
+            if (outputStream == null)
+                throw new ArgumentException("OutputStream");
+            if (passPhrase == null)
+                passPhrase = String.Empty;
+
+            Decrypt(inputStream, outputStream, passPhrase);
+            return outputStream;
+        }
+
+        /// <summary>
+        /// PGP decrypt a given file.
+        /// </summary>
+        /// <param name="inputFilePath">PGP encrypted data file path</param>
+        /// <param name="outputFilePath">Output PGP decrypted file path</param>
+        /// <param name="passPhrase">PGP secret key password</param>
+        public void DecryptFile(string inputFilePath, string outputFilePath, string passPhrase)
+        {
+            if (String.IsNullOrEmpty(inputFilePath))
+                throw new ArgumentException("InputFilePath");
+            if (String.IsNullOrEmpty(outputFilePath))
+                throw new ArgumentException("OutputFilePath");
+            if (passPhrase == null)
+                passPhrase = String.Empty;
+
+            if (!File.Exists(inputFilePath))
+                throw new FileNotFoundException(String.Format("Encrypted File [{0}] not found.", inputFilePath));
+            
+            using (Stream inputStream = File.OpenRead(inputFilePath))
+            {
+                using (Stream outStream = File.Create(outputFilePath))
+                    Decrypt(inputStream, outStream, passPhrase);
+            }
+        }
+
+        private void Decrypt(Stream inputStream, Stream outputStream, string passPhrase)
+        {
+            Decrypt(inputStream, outputStream, passPhrase.ToCharArray());
+        }
+
+        private void Decrypt(Stream inputStream, Stream outputStream, char[] passPhrase)
+        {
+            if (inputStream == null)
+                throw new ArgumentException("InputStream");
+            if (outputStream == null)
+                throw new ArgumentException("outputStream");
+            if (passPhrase == null)
+                throw new ArgumentException("passPhrase");
+
+            PgpObjectFactory objFactory = new PgpObjectFactory(PgpUtilities.GetDecoderStream(inputStream));
+            PgpObject obj = objFactory.NextPgpObject();
+
+            // the first object might be a PGP marker packet.
+            PgpEncryptedDataList enc = null;
+            if (obj is PgpEncryptedDataList)
+                enc = (PgpEncryptedDataList)obj;
+            else
+                enc = (PgpEncryptedDataList)objFactory.NextPgpObject();
+
+            // If enc is null at this point, we failed to detect the contents of the encrypted stream.
+            if (enc == null)
+                throw new ArgumentException("Failed to detect encrypted content format.", nameof(inputStream));
+
+            PgpPbeEncryptedData pbe = (PgpPbeEncryptedData)enc[0];
+
+            PgpObjectFactory plainFact = null;
+
+            using (Stream clear = pbe.GetDataStream(passPhrase))
+            {
+                plainFact = new PgpObjectFactory(clear);
+            }
+
+            PgpObject message = plainFact.NextPgpObject();
+
+            if (message is PgpOnePassSignatureList)
+            {
+                message = plainFact.NextPgpObject();
+            }
+
+            if (message is PgpCompressedData)
+            {
+                PgpCompressedData cData = (PgpCompressedData)message;
+                PgpObjectFactory of = null;
+
+                using (Stream compDataIn = cData.GetDataStream())
+                {
+                    of = new PgpObjectFactory(compDataIn);
+                }
+
+                message = of.NextPgpObject();
+                if (message is PgpOnePassSignatureList)
+                {
+                    message = of.NextPgpObject();
+                    PgpLiteralData Ld = null;
+                    Ld = (PgpLiteralData)message;
+                    Stream unc = Ld.GetInputStream();
+                    Streams.PipeAll(unc, outputStream);
+                }
+                else
+                {
+                    PgpLiteralData Ld = null;
+                    Ld = (PgpLiteralData)message;
+                    Stream unc = Ld.GetInputStream();
+                    Streams.PipeAll(unc, outputStream);
+                }
+            }
+            else if (message is PgpLiteralData)
+            {
+                PgpLiteralData ld = (PgpLiteralData)message;
+                string outFileName = ld.FileName;
+
+                Stream unc = ld.GetInputStream();
+                Streams.PipeAll(unc, outputStream);
+
+                if (pbe.IsIntegrityProtected())
+                {
+                    if (!pbe.Verify())
+                    {
+                        throw new PgpException("Message failed integrity check.");
+                    }
+                }
+            }
+            else if (message is PgpOnePassSignatureList)
+                throw new PgpException("Encrypted message contains a signed message - not literal data.");
+            else
+                throw new PgpException("Message is not a simple encrypted file.");
+        }
         #endregion Decrypt
 
         #region DecryptAndVerify
